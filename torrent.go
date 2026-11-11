@@ -3611,6 +3611,12 @@ func sendUtHolepunchMsg(
 	addrPort netip.AddrPort,
 	errCode utHolepunch.ErrCode,
 ) {
+	// A peer can reach our ut_holepunch handler using the extension id we advertised, without
+	// advertising ut_holepunch itself. We then have no id to address a reply to it with, so there's
+	// nothing to send. Checking here covers every caller, including replies to a message's sender.
+	if !pc.supportsExtension(utHolepunch.ExtensionName) {
+		return
+	}
 	holepunchMsg := utHolepunch.Msg{
 		MsgType:  msgType,
 		AddrPort: addrPort,

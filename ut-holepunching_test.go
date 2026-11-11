@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"testing"
@@ -17,6 +18,9 @@ import (
 	"github.com/anacrolix/missinggo/v2/iter"
 	qt "github.com/go-quicktest/qt"
 	"golang.org/x/time/rate"
+
+	pp "github.com/anacrolix/torrent/peer_protocol"
+	utHolepunch "github.com/anacrolix/torrent/peer_protocol/ut-holepunch"
 
 	"github.com/anacrolix/torrent/internal/testutil"
 )
@@ -405,4 +409,86 @@ func TestUtpDirectDialMsg(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	t.FailNow()
+}
+
+// A peer can reach our ut_holepunch handler using the extension id we advertise, without listing
+// ut_holepunch in its own extended handshake. Replying to such a sender must not panic the client.
+func TestHolepunchRendezvousFromSenderWithoutExtension(t *testing.T) {
+	_, c := newNetworkBoundsTestConn(t, TestingConfig(t), true)
+	// A real inbound peer has a routable dial address but has not advertised ut_holepunch.
+	c.RemoteAddr = netip.MustParseAddrPort("203.0.113.5:6881")
+	c.PeerExtensionIDs = map[pp.ExtensionName]pp.ExtensionNumber{pp.ExtensionNameMetadata: 1}
+	// Set during the real handshake; the test conn is built without one.
+	c.LocalLtepProtocolMap = &c.t.cl.defaultLocalLtepProtocolMap
+
+	// The id the client advertises for ut_holepunch, which a peer uses to address the message.
+	ourID := c.LocalLtepProtocolMap.toSupportedExtensionDict()[utHolepunch.ExtensionName]
+	qt.Assert(t, qt.Not(qt.Equals(ourID, 0)))
+
+	// A rendezvous for an address we aren't connected to makes us reply to the sender.
+	rzv := utHolepunch.Msg{
+		MsgType:  utHolepunch.Rendezvous,
+		AddrPort: netip.MustParseAddrPort("192.0.2.1:6881"),
+	}
+	payload, err := rzv.MarshalBinary()
+	qt.Assert(t, qt.IsNil(err))
+
+	qt.Check(t, qt.IsNil(c.onReadExtendedMsg(ourID, payload)))
+}
+
+// Fuzz the ut_holepunch handler through the real extended-message ingress with a sender that has
+// not advertised ut_holepunch. No crafted payload, well-formed or not, may panic the client.
+func FuzzUtHolepunchHandlerFromUnadvertisedSender(f *testing.F) {
+	for _, m := range []utHolepunch.Msg{
+		{MsgType: utHolepunch.Rendezvous, AddrPort: netip.MustParseAddrPort("192.0.2.1:6881")},
+		{MsgType: utHolepunch.Connect, AddrPort: netip.MustParseAddrPort("192.0.2.2:6881")},
+		{MsgType: utHolepunch.Error, AddrPort: netip.MustParseAddrPort("[2001:db8::1]:6881"), ErrCode: utHolepunch.NoSupport},
+	} {
+		b, err := m.MarshalBinary()
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(b)
+	}
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		_, c := newNetworkBoundsTestConn(t, TestingConfig(t), true)
+		c.RemoteAddr = netip.MustParseAddrPort("203.0.113.5:6881")
+		c.PeerExtensionIDs = map[pp.ExtensionName]pp.ExtensionNumber{pp.ExtensionNameMetadata: 1}
+		c.LocalLtepProtocolMap = &c.t.cl.defaultLocalLtepProtocolMap
+		ourID := c.LocalLtepProtocolMap.toSupportedExtensionDict()[utHolepunch.ExtensionName]
+		// A malformed payload must only ever error, never panic.
+		_ = c.onReadExtendedMsg(ourID, payload)
+	})
+}
+
+// A rendezvous whose target IS connected exercises the per-target sender reply. The sender did not
+// advertise ut_holepunch, so that reply must be skipped without panicking, while the connected
+// target still receives its Connect.
+func TestHolepunchRendezvousTargetPresentSenderNoExtension(t *testing.T) {
+	tt, sender := newNetworkBoundsTestConn(t, TestingConfig(t), true)
+	sender.RemoteAddr = netip.MustParseAddrPort("203.0.113.5:6881")
+	sender.PeerExtensionIDs = map[pp.ExtensionName]pp.ExtensionNumber{pp.ExtensionNameMetadata: 1}
+	sender.LocalLtepProtocolMap = &sender.t.cl.defaultLocalLtepProtocolMap
+	ourID := sender.LocalLtepProtocolMap.toSupportedExtensionDict()[utHolepunch.ExtensionName]
+
+	// A connected target at the rendezvous address that DOES support ut_holepunch.
+	targetAddr := netip.MustParseAddrPort("198.51.100.9:6881")
+	to, tw := net.Pipe()
+	t.Cleanup(func() { tw.Close() })
+	go io.Copy(io.Discard, tw)
+	target := sender.t.cl.newConnection(to, newConnectionOpts{network: "test"})
+	target.setTorrent(tt)
+	target.RemoteAddr = targetAddr
+	target.PeerExtensionIDs = map[pp.ExtensionName]pp.ExtensionNumber{utHolepunch.ExtensionName: 7}
+	target.LocalLtepProtocolMap = &sender.t.cl.defaultLocalLtepProtocolMap
+	target.startMessageWriter()
+	t.Cleanup(func() { target.closed.Set() })
+	tt.conns[target] = struct{}{}
+
+	rzv := utHolepunch.Msg{MsgType: utHolepunch.Rendezvous, AddrPort: targetAddr}
+	payload, err := rzv.MarshalBinary()
+	qt.Assert(t, qt.IsNil(err))
+
+	// Must not panic even though the target is connected and the sender can't be replied to.
+	qt.Check(t, qt.IsNil(sender.onReadExtendedMsg(ourID, payload)))
 }
