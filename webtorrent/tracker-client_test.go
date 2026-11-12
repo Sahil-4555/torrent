@@ -5,6 +5,7 @@ package webtorrent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/anacrolix/torrent/tracker"
 	"github.com/coder/websocket"
+	"github.com/pion/webrtc/v4"
 )
 
 func TestTrackerAnnounceEventEncoding(t *testing.T) {
@@ -94,6 +96,129 @@ func TestTrackerAnnounceEventEncoding(t *testing.T) {
 	}
 }
 
+// TestAnsweringPeerConnectionsAreCapped checks that a tracker flooding offers
+// cannot make the client hold more than maxConcurrentAnsweringPeerConns
+// answering peer connections at once. Without the cap the client creates one
+// per offer, so the count tracks the flood size.
+func TestAnsweringPeerConnectionsAreCapped(t *testing.T) {
+	const limit = 3
+	const flood = 30
+
+	defer func(prev int) { maxConcurrentAnsweringPeerConns = prev }(maxConcurrentAnsweringPeerConns)
+	maxConcurrentAnsweringPeerConns = limit
+
+	// One valid offer, reused with distinct offer ids.
+	offerPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := offerPC.CreateDataChannel("webrtc-datachannel", nil); err != nil {
+		t.Fatal(err)
+	}
+	rawOffer, err := offerPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gather := webrtc.GatheringCompletePromise(offerPC)
+	if err := offerPC.SetLocalDescription(rawOffer); err != nil {
+		t.Fatal(err)
+	}
+	<-gather
+	offer := *offerPC.LocalDescription()
+	offerPC.Close()
+
+	var infoHash [20]byte
+	for i := range infoHash {
+		infoHash[i] = byte(i + 1)
+	}
+	ihJSON := binaryToJsonString(infoHash[:])
+	peerJSON := binaryToJsonString(make([]byte, 20))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		conn.SetReadLimit(-1)
+		// Drain whatever the client sends (its announce).
+		go func() {
+			for {
+				if _, _, err := conn.Read(r.Context()); err != nil {
+					return
+				}
+			}
+		}()
+		for i := 0; i < flood; i++ {
+			resp := AnnounceResponse{
+				Action:   "announce",
+				InfoHash: ihJSON,
+				PeerID:   peerJSON,
+				Offer:    &offer,
+				OfferID:  fmt.Sprintf("offer-%d", i),
+			}
+			data, _ := json.Marshal(resp)
+			if err := conn.Write(r.Context(), websocket.MessageText, data); err != nil {
+				return
+			}
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	tc := &TrackerClient{
+		Url: "ws" + strings.TrimPrefix(server.URL, "http"),
+		GetAnnounceRequest: func(tracker.AnnounceEvent, [20]byte) (tracker.AnnounceRequest, error) {
+			return tracker.AnnounceRequest{}, nil
+		},
+		OnConn:               func(DataChannelConn, DataChannelContext) {},
+		OnConnected:          func(error) {},
+		OnDisconnected:       func(error) {},
+		OnAnnounceSuccessful: func(string) {},
+		OnAnnounceError:      func(string, error) {},
+	}
+	tc.cond.L = &tc.mu
+	tc.pingTicker = time.NewTicker(time.Hour)
+	defer tc.pingTicker.Stop()
+
+	go func() { _ = tc.doWebsocket() }()
+	defer func() {
+		tc.mu.Lock()
+		tc.closed = true
+		if tc.wsConn != nil {
+			tc.wsConn.CloseNow()
+		}
+		tc.mu.Unlock()
+	}()
+
+	// Give the client time to process the flood, tracking the peak held.
+	peak := 0
+	deadline := time.After(10 * time.Second)
+	for {
+		tc.mu.Lock()
+		n := len(tc.rtcPeerConns)
+		tc.mu.Unlock()
+		if n > peak {
+			peak = n
+		}
+		if peak > limit {
+			break // already violated; fail below
+		}
+		select {
+		case <-deadline:
+			goto check
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+check:
+	if peak < 1 {
+		t.Fatal("no answering peer connections were created; flood never reached the handler")
+	}
+	if peak > limit {
+		t.Fatalf("held %d concurrent answering peer connections, want at most %d", peak, limit)
+	}
+}
+
 func TestUnansweredTrackerPingClosesConnection(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
@@ -107,8 +232,8 @@ func TestUnansweredTrackerPingClosesConnection(t *testing.T) {
 	defer server.Close()
 
 	tc := &TrackerClient{
-		Url:           "ws" + strings.TrimPrefix(server.URL, "http"),
-		OnConnected:   func(error) {},
+		Url:            "ws" + strings.TrimPrefix(server.URL, "http"),
+		OnConnected:    func(error) {},
 		OnDisconnected: func(error) {},
 	}
 	tc.cond.L = &tc.mu

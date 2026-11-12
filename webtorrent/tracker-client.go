@@ -26,6 +26,12 @@ const (
 	pingTimeout      = 30 * time.Second
 )
 
+// The most answering (inbound) WebRTC peer connections a single tracker client will hold at once.
+// Each offer a tracker sends us makes us create a peer connection that is kept until it connects or
+// times out, so without a bound a tracker can make us open an unbounded number of them. Legitimate
+// peers are limited well below this elsewhere. A var so tests can lower it.
+var maxConcurrentAnsweringPeerConns = 128
+
 type TrackerClientStats struct {
 	Dials                  int64
 	ConvertedInboundConns  int64
@@ -58,6 +64,9 @@ type TrackerClient struct {
 
 	// Used for stats only I think.
 	rtcPeerConns map[string]*wrappedPeerConnection
+	// Number of answering (inbound) peer connections currently held, bounded by
+	// maxConcurrentAnsweringPeerConns.
+	answeringPeerConns int
 
 	// callbacks
 	OnConnected          func(error)
@@ -271,8 +280,7 @@ func (tc *TrackerClient) Announce(event tracker.AnnounceEvent, infoHash [20]byte
 	}
 
 	// save the leecher peer connections
-	tc.storePeerConnection(fmt.Sprintf("%x", randOfferId[:]), pc)
-
+	tc.storePeerConnection(fmt.Sprintf("%x", randOfferId[:]), pc, false)
 
 	tc.slogger().Debug("announcing offer")
 	err = tc.announce(event, infoHash, []outboundOffer{{
@@ -292,9 +300,12 @@ func (tc *TrackerClient) Announce(event tracker.AnnounceEvent, infoHash [20]byte
 }
 
 // Remove peer conn so it doesn't come up in stats.
-func (tc *TrackerClient) removePeerConn(key string) {
+func (tc *TrackerClient) removePeerConn(key string, answering bool) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
+	if answering && tc.answeringPeerConns > 0 {
+		tc.answeringPeerConns--
+	}
 	delete(tc.rtcPeerConns, key)
 }
 
@@ -424,13 +435,25 @@ func (tc *TrackerClient) handleOffer(
 	offerContext offerContext,
 	peerId string,
 ) error {
+	tc.mu.Lock()
+	if tc.answeringPeerConns >= maxConcurrentAnsweringPeerConns {
+		tc.mu.Unlock()
+		metrics.Add("answering peer connections dropped at limit", 1)
+		return nil
+	}
+	tc.answeringPeerConns++
+	tc.mu.Unlock()
+
 	peerConnection, answer, err := tc.newAnsweringPeerConnection(offerContext)
 	if err != nil {
+		tc.mu.Lock()
+		tc.answeringPeerConns--
+		tc.mu.Unlock()
 		return fmt.Errorf("creating answering peer connection: %w", err)
 	}
 
 	// save the seeder peer connections
-	tc.storePeerConnection(fmt.Sprintf("%x", offerContext.Id[:]), peerConnection)
+	tc.storePeerConnection(fmt.Sprintf("%x", offerContext.Id[:]), peerConnection, true)
 
 	response := AnnounceResponse{
 		Action:   "announce",
@@ -475,11 +498,11 @@ func (tc *TrackerClient) handleAnswer(offerId string, answer webrtc.SessionDescr
 	go tc.Announce(tracker.None, offer.infoHash)
 }
 
-func (tc *TrackerClient) storePeerConnection(offerId string, pc *wrappedPeerConnection) {
+func (tc *TrackerClient) storePeerConnection(offerId string, pc *wrappedPeerConnection, answering bool) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	pc.OnClose(func() {
-		go tc.removePeerConn(offerId)
+		go tc.removePeerConn(offerId, answering)
 	})
 	g.MakeMapIfNil(&tc.rtcPeerConns)
 	tc.rtcPeerConns[offerId] = pc

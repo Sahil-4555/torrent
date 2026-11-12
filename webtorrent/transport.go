@@ -42,12 +42,18 @@ type wrappedPeerConnection struct {
 	span trace.Span
 	ctx  context.Context
 
+	closed         bool
 	onCloseHandler func()
 }
 
 func (me *wrappedPeerConnection) Close() error {
 	me.closeMu.Lock()
 	defer me.closeMu.Unlock()
+
+	if me.closed {
+		return nil
+	}
+	me.closed = true
 
 	me.onClose()
 

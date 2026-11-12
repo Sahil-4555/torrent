@@ -42,7 +42,7 @@ func TestClosedPeerConnectionRemovedFromStats(t *testing.T) {
 	var tc TrackerClient
 	pc, err := newPeerConnection(tc.slogger(), nil)
 	qt.Assert(t, qt.IsNil(err))
-	tc.storePeerConnection("offer", pc)
+	tc.storePeerConnection("offer", pc, false)
 	qt.Assert(t, qt.HasLen(tc.rtcPeerConns, 1))
 	qt.Assert(t, qt.IsNil(pc.Close()))
 
