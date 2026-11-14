@@ -310,3 +310,34 @@ func TestMetadataSizeNotResetByOnePeer(t *testing.T) {
 	qt.Check(t, qt.HasLen(tt.metadataBytes, realSize+1))
 	qt.Check(t, qt.IsFalse(tt.haveMetadataPiece(0)))
 }
+
+// Pieces a peer claims before we have the info are trimmed to the piece count when we get it.
+// Availability counted from the untrimmed pieces included ones the peer doesn't have, which were
+// never taken back, and dropping the torrent then panicked.
+func TestPreInfoPiecesPastEndDontCountAsAvailable(t *testing.T) {
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
+	defer cl.Close()
+	mi := testutil.GreetingMetaInfo()
+	info, err := mi.UnmarshalInfo()
+	qt.Assert(t, qt.IsNil(err))
+	tt, _ := cl.AddTorrentInfoHash(mi.HashInfoBytes())
+	cl.lock()
+	defer cl.unlock()
+	c := cl.newConnection(nil, newConnectionOpts{
+		network:    "tcp",
+		remoteAddr: &net.TCPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5678},
+	})
+	c.setTorrent(tt)
+	c.initMessageWriter()
+	qt.Assert(t, qt.IsNil(tt.addPeerConn(c)))
+	// As many pieces as the torrent has, but all but piece 0, and one past the end.
+	for i := 1; i <= info.NumPieces(); i++ {
+		qt.Assert(t, qt.IsNil(c.peerSentHave(i)))
+	}
+	qt.Assert(t, qt.IsNil(tt.setInfoBytesLocked(mi.InfoBytes, nil)))
+	qt.Check(t, qt.Equals(tt.pieces[0].relativeAvailability, int32(0)))
+	for i := 1; i < info.NumPieces(); i++ {
+		qt.Check(t, qt.Equals(tt.pieces[i].relativeAvailability, int32(1)))
+	}
+}

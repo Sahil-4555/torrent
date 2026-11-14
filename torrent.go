@@ -248,7 +248,10 @@ func (t *Torrent) selectivePieceAvailabilityFromPeers(i pieceIndex) (count int) 
 		if _, ok := t.connsWithAllPieces[peer]; ok {
 			return
 		}
-		if peer.peerHasPiece(i) {
+		// Not peerHasPiece: this runs before pieces the peer claimed without the info are trimmed
+		// to the piece count, and with as many pieces as the torrent it would report all of them.
+		// The peer's pieces are what's taken back when it goes.
+		if peer.peerPieces().ContainsInt(i) {
 			count++
 		}
 	})
