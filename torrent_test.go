@@ -316,3 +316,32 @@ func BenchmarkMakePieces(b *testing.B) {
 		tt.makePieces()
 	}
 }
+
+// Empty files in a v2 torrent have no pieces root. Looking up a file by pieces root, as answering a
+// peer's hash request does, used to panic on them.
+func TestGetFileByPiecesRootWithEmptyFile(t *testing.T) {
+	var root [32]byte
+	root[0] = 0xaa
+	info := metainfo.Info{
+		MetaVersion: 2,
+		Name:        "x",
+		PieceLength: 1 << 14,
+		FileTree: metainfo.FileTree{Dir: map[string]metainfo.FileTree{
+			"a": {File: metainfo.FileTreeFile{}},
+			"b": {File: metainfo.FileTreeFile{Length: 2 << 14, PiecesRoot: string(root[:])}},
+		}},
+	}
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
+	defer cl.Close()
+	tt, err := cl.AddTorrent(&metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(&info)})
+	qt.Assert(t, qt.IsNil(err))
+	<-tt.GotInfo()
+	cl.lock()
+	defer cl.unlock()
+	files := *tt.files
+	qt.Assert(t, qt.HasLen(files, 2))
+	qt.Assert(t, qt.IsFalse(files[0].piecesRoot.Ok))
+	qt.Check(t, qt.Equals(tt.getFileByPiecesRoot(root), files[1]))
+	qt.Check(t, qt.IsNil(tt.getFileByPiecesRoot([32]byte{1})))
+}
